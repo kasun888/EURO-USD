@@ -1,42 +1,32 @@
 """
-OANDA — EUR/USD Multi-Session Scalp Bot  (Strategy V4)
-=======================================================
+OANDA — EUR/USD NY Session Scalp Bot  (Strategy V7-PLUS)
+=========================================================
 Pair:     EUR/USD only
 Size:     74,000 units
-SL:       8 pips
-TP:       12 pips   [R:R 1.5]
+SL:       7 pips   ≈ SGD 70
+TP:       10 pips  ≈ SGD 100  [R:R 1.43]
 Max dur:  45 minutes
 
-ALL 3 SESSIONS (UTC):
-  Session 1 — Asian/London overlap : 06:00–09:00 UTC  (14:00–17:00 SGT)
-  Session 2 — London               : 09:00–12:00 UTC  (17:00–20:00 SGT)
-  Session 3 — NY                   : 13:00–16:00 UTC  (21:00–00:00 SGT)
+SESSION: NY ONLY
+  13:00–16:00 UTC  =  21:00–00:00 SGT
+  Best EUR/USD window: US data releases, USD flows, cleanest trends.
 
-WHY THESE WINDOWS:
-  06-09 UTC  → Frankfurt/London both open, EUR liquidity building, early trends
-  09-12 UTC  → London peak session, highest EUR/USD volume of the day
-  13-16 UTC  → NY open, USD data releases, second-best EUR/USD window
-  SKIPPED    → 00-06 UTC (Asian dead zone, EUR/USD moves <15 pips)
-  SKIPPED    → 16-24 UTC (NY close, spreads widen, low volume)
-
-SPREAD CAPS per session:
-  Asian/London overlap : 1.2 pips (tighter spread early)
-  London               : 1.2 pips (best liquidity)
-  NY                   : 1.5 pips (slightly wider acceptable)
-
-SIGNAL (4 layers, no state machine):
-  L0  H4 EMA50       macro direction
-  L1  H4 ATR(14)     >6 pip — trending market only
-  L2  H1 EMA20+EMA50 price alignment + RSI 30–70 + ATR >4.5p
-  L3  M15 EMA9>EMA21 ongoing trend + RSI 38–62 + ATR >4.5p
-  L4  M5 close vs EMA9 + body ≥50%
+SIGNAL (4 layers):
+  L0  H4 EMA50       + last 3 bars same side (trend consistency)
+  L1  H4 ATR(14)     > 6 pip (trending market)
+  L2  H1 EMA20+EMA50 price above/below BOTH + ATR > 4.5p
+  L3  M15 EMA9/EMA21 ongoing trend + RSI 38–62 + ATR > 4.5p
+  L4  M5 close vs EMA9 + body ≥45%
 
 RULES:
-  - Max 2 trades per day total (across all sessions)
-  - 15-min cooldown after any SL or TIMEOUT loss
-  - 45-min hard close
-  - News filter: skip 30 min before/after high-impact events
-  - No trades Friday after 14:00 UTC (weekend risk)
+  - Max 1 trade per day
+  - 15 min cooldown after any loss
+  - CIRCUIT BREAKER: 2 SL hits in a row → pause 2 calendar days
+    (Protects against trend reversal whipsaw periods)
+  - 45 min hard close
+  - News filter: skip 30 min before/after high-impact EUR/USD events
+  - No trades Friday after 14:00 UTC
+  - All Telegram alerts in SGD with live balance
 """
 
 import os
@@ -44,7 +34,7 @@ import json
 import time
 import logging
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import pytz
@@ -63,39 +53,28 @@ utc_tz = pytz.UTC
 signals = SignalEngine()
 
 # ── TRADE PARAMETERS ─────────────────────────────────────────────────
-TRADE_SIZE   = 74_000
-SL_PIPS      = 8
-TP_PIPS      = 12
-MAX_DURATION = 45
-MAX_PER_DAY  = 2
-COOLDOWN_MIN = 15
-USD_SGD      = 1.35
+TRADE_SIZE    = 74_000
+SL_PIPS       = 7        # V7-PLUS: tighter SL
+TP_PIPS       = 10       # V7-PLUS: realistic for 45min NY window
+MAX_DURATION  = 45
+MAX_PER_DAY   = 1        # 1 quality trade per day
+COOLDOWN_MIN  = 15
+USD_SGD       = 1.35
 
-# ── SESSION CONFIG ───────────────────────────────────────────────────
-# All times in UTC. SGT = UTC + 8.
-SESSIONS = [
-    {
-        "label":      "Asian-London",
-        "utc_start":  6,
-        "utc_end":    9,
-        "sgt_label":  "14:00–17:00 SGT",
-        "max_spread": 1.2,
-    },
-    {
-        "label":      "London",
-        "utc_start":  9,
-        "utc_end":    12,
-        "sgt_label":  "17:00–20:00 SGT",
-        "max_spread": 1.2,
-    },
-    {
-        "label":      "NY",
-        "utc_start":  13,
-        "utc_end":    16,
-        "sgt_label":  "21:00–00:00 SGT",
-        "max_spread": 1.5,
-    },
-]
+# ── CIRCUIT BREAKER ───────────────────────────────────────────────────
+# After 2 consecutive SL hits → pause for 2 days
+# Protects against whipsaw/trend reversal periods
+MAX_CONSEC_SL    = 2
+PAUSE_DAYS       = 2
+
+# ── SESSION ───────────────────────────────────────────────────────────
+SESSION = {
+    "label":      "NY",
+    "utc_start":  13,
+    "utc_end":    16,
+    "sgt_label":  "21:00–00:00 SGT",
+    "max_spread": 1.5,
+}
 
 ASSET = {
     "instrument": "EUR_USD",
@@ -119,17 +98,13 @@ def load_settings():
     return DEFAULT_SETTINGS
 
 
-def get_active_session():
-    """Return the active session dict or None."""
+def is_in_session():
     now_utc = datetime.now(utc_tz)
     h = now_utc.hour
     # No trades Friday after 14:00 UTC
     if now_utc.weekday() == 4 and h >= 14:
-        return None
-    for s in SESSIONS:
-        if s["utc_start"] <= h < s["utc_end"]:
-            return s
-    return None
+        return False
+    return SESSION["utc_start"] <= h < SESSION["utc_end"]
 
 
 def set_cooldown(state):
@@ -161,8 +136,30 @@ def cooldown_remaining(state):
         return "?"
 
 
+def is_paused(state):
+    """Circuit breaker — paused after 2 consecutive SL hits."""
+    p = state.get("pause_until")
+    if not p:
+        return False
+    try:
+        return datetime.now(timezone.utc) < datetime.fromisoformat(p)
+    except Exception:
+        return False
+
+
+def pause_remaining_days(state):
+    p = state.get("pause_until")
+    if not p:
+        return 0
+    try:
+        remaining = (datetime.fromisoformat(p) -
+                     datetime.now(timezone.utc)).total_seconds() / 86400
+        return max(0, round(remaining, 1))
+    except Exception:
+        return "?"
+
+
 def detect_sl_tp_hits(state, trader, alert):
-    """Detect closed trades and update W/L counters."""
     name = ASSET["instrument"]
     if name not in state.get("open_times", {}):
         return
@@ -186,18 +183,35 @@ def detect_sl_tp_hits(state, trader, alert):
 
         if pnl < 0:
             set_cooldown(state)
-            state["losses"]        = losses + 1
+            state["losses"]       = losses + 1
+            consec = state.get("consec_sl", 0) + 1
+            state["consec_sl"]    = consec
             state["consec_losses"] = state.get("consec_losses", 0) + 1
+
+            # Circuit breaker
+            cb_msg = ""
+            if consec >= MAX_CONSEC_SL:
+                pause_dt = datetime.now(timezone.utc) + timedelta(days=PAUSE_DAYS)
+                state["pause_until"] = pause_dt.isoformat()
+                state["consec_sl"]   = 0
+                cb_msg = ("\n⛔ CIRCUIT BREAKER — " + str(MAX_CONSEC_SL) +
+                          " SL in a row!\nPausing " + str(PAUSE_DAYS) +
+                          " days to let market settle.")
+                log.warning("Circuit breaker triggered — pausing " +
+                            str(PAUSE_DAYS) + " days")
+
             alert.send(
                 "🔴 SL HIT — LOSS\n"
                 + ASSET["emoji"] + " EUR/USD\n"
                 "Loss:      SGD -" + str(abs(pnl_sgd)) + "\n"
                 "Balance:   SGD " + str(bal_sgd) + "\n"
                 "⏳ Cooldown " + str(COOLDOWN_MIN) + " min\n"
-                "W/L today: " + str(wins) + "/" + str(state["losses"])
+                "W/L today: " + str(wins) + "/" + str(state["losses"]) +
+                cb_msg
             )
         else:
             state["wins"]          = wins + 1
+            state["consec_sl"]     = 0
             state["consec_losses"] = 0
             alert.send(
                 "✅ TP HIT — WIN\n"
@@ -224,13 +238,12 @@ def run_bot(state):
              "  (" + now_utc.strftime("%H:%M UTC") + ")")
 
     # ── Session gate ─────────────────────────────────────────────────
-    sess = get_active_session()
-    if not sess:
-        log.info("Outside all trading sessions — sleeping")
+    if not is_in_session():
+        log.info("Outside NY session (13–16 UTC / 21–00 SGT) — sleeping")
         return
 
-    log.info("Session: " + sess["label"] + " (" + sess["sgt_label"] + ")" +
-             " | Max spread: " + str(sess["max_spread"]) + "p")
+    log.info("Session: NY (13:00–16:00 UTC / 21:00–00:00 SGT) | " +
+             "Max spread: " + str(SESSION["max_spread"]) + "p")
 
     # ── Login ─────────────────────────────────────────────────────────
     trader = OandaTrader(demo=settings["demo_mode"])
@@ -242,31 +255,36 @@ def run_bot(state):
     if "start_balance" not in state or state["start_balance"] == 0.0:
         state["start_balance"] = current_balance
 
-    # ── Session open alert (once per session per day) ─────────────────
-    # Fires AFTER login so balance is always live and accurate
-    alert_key = "sess_" + today + "_" + sess["label"]
+    # ── Session open alert (once per day, after live balance) ─────────
+    alert_key = "ny_open_" + today
     if not state.get("session_alerted", {}).get(alert_key) and \
-       now_utc.hour == sess["utc_start"]:
+       now_utc.hour == SESSION["utc_start"]:
         state.setdefault("session_alerted", {})[alert_key] = True
-        bal_usd     = round(current_balance, 2)
-        bal_sgd     = round(current_balance * USD_SGD, 2)
-        start_usd   = round(state.get("start_balance", current_balance), 2)
-        start_sgd   = round(start_usd * USD_SGD, 2)
-        daily_usd   = round(current_balance - start_usd, 2)
-        daily_sgd   = round(daily_usd * USD_SGD, 2)
-        daily_sign  = "+" if daily_sgd >= 0 else ""
-        wins        = state.get("wins", 0)
-        losses      = state.get("losses", 0)
+        bal_sgd    = round(current_balance * USD_SGD, 2)
+        start_sgd  = round(state.get("start_balance", current_balance) * USD_SGD, 2)
+        daily_usd  = round(current_balance - state.get("start_balance", current_balance), 2)
+        daily_sgd  = round(daily_usd * USD_SGD, 2)
+        daily_sign = "+" if daily_sgd >= 0 else ""
+        wins       = state.get("wins", 0)
+        losses     = state.get("losses", 0)
+        pause_info = ""
+        if is_paused(state):
+            pause_info = ("\n⛔ Circuit breaker active — " +
+                          str(pause_remaining_days(state)) + " days remaining")
         alert.send(
-            "🔔 " + sess["label"] + " Session Open!\n"
-            "⏰ " + sess["sgt_label"] + "\n"
+            "🔔 NY Session Open!\n"
+            "⏰ 21:00–00:00 SGT\n"
             "─────────────────\n"
             "💰 Balance:    SGD " + str(bal_sgd) + "\n"
             "📈 Day start:  SGD " + str(start_sgd) + "\n"
             "📊 Daily P&L:  SGD " + daily_sign + str(daily_sgd) + "\n"
             "🏆 W/L today:  " + str(wins) + "/" + str(losses) + "\n"
             "─────────────────\n"
-            "Pair: EUR/USD | TP=" + str(TP_PIPS) + "p SL=" + str(SL_PIPS) + "p"
+            "TP=" + str(TP_PIPS) + "p (≈SGD " +
+            str(round(TRADE_SIZE * TP_PIPS * ASSET["pip"] * USD_SGD, 0)) +
+            ") | SL=" + str(SL_PIPS) + "p (≈SGD " +
+            str(round(TRADE_SIZE * SL_PIPS * ASSET["pip"] * USD_SGD, 0)) +
+            ")" + pause_info
         )
 
     detect_sl_tp_hits(state, trader, alert)
@@ -296,8 +314,8 @@ def run_bot(state):
                         "⏰ 45-MIN TIMEOUT\n"
                         + ASSET["emoji"] + " EUR/USD\n"
                         "Closed at " + str(round(mins, 1)) + " min\n"
-                        "PnL:     SGD " + ("+" if pnl_sgd >= 0 else "") + str(pnl_sgd) + " " +
-                        ("✅" if pnl >= 0 else "🔴") + "\n"
+                        "PnL:     SGD " + ("+" if pnl_sgd >= 0 else "") +
+                        str(pnl_sgd) + " " + ("✅" if pnl >= 0 else "🔴") + "\n"
                         "Balance: SGD " + str(live_bal_sgd)
                     )
         except Exception as e:
@@ -307,8 +325,13 @@ def run_bot(state):
     # ── Daily trade limit ────────────────────────────────────────────
     today_trades = state.get("daily_trades", {}).get(today, 0)
     if today_trades >= MAX_PER_DAY:
-        log.info("Daily limit reached (" + str(MAX_PER_DAY) +
-                 " trades) — done for today")
+        log.info("Daily limit reached (" + str(MAX_PER_DAY) + " trade) — done for today")
+        return
+
+    # ── Circuit breaker check ─────────────────────────────────────────
+    if is_paused(state):
+        log.info("Circuit breaker active — " +
+                 str(pause_remaining_days(state)) + " days remaining. No trades.")
         return
 
     # ── Cooldown ─────────────────────────────────────────────────────
@@ -323,9 +346,9 @@ def run_bot(state):
         return
 
     spread_pip = (ask - bid) / ASSET["pip"]
-    if spread_pip > sess["max_spread"] + 0.05:
-        log.info("Spread " + str(round(spread_pip, 2)) +
-                 "p > max " + str(sess["max_spread"]) + "p — skip")
+    if spread_pip > SESSION["max_spread"] + 0.05:
+        log.info("Spread " + str(round(spread_pip, 2)) + "p > max " +
+                 str(SESSION["max_spread"]) + "p — skip")
         return
 
     # ── News filter ──────────────────────────────────────────────────
@@ -335,7 +358,7 @@ def run_bot(state):
         if not state.get("news_alerted", {}).get(news_key):
             state.setdefault("news_alerted", {})[news_key] = True
             alert.send("⚠️ NEWS BLOCK\n" + ASSET["emoji"] +
-                       " EUR/USD\n" + news_reason + "\nSkipping")
+                       " EUR/USD\n" + news_reason + "\nSkipping trade")
         log.info("News block: " + news_reason)
         return
 
@@ -347,12 +370,12 @@ def run_bot(state):
              " dir=" + direction + " | " + details)
 
     if score < threshold or direction == "NONE":
-        log.info(name + ": no setup — waiting")
+        log.info(name + ": no setup — waiting for alignment")
         return
 
     # ── Place trade ──────────────────────────────────────────────────
-    sl_sgd = round(TRADE_SIZE * SL_PIPS  * ASSET["pip"] * USD_SGD, 2)
-    tp_sgd = round(TRADE_SIZE * TP_PIPS  * ASSET["pip"] * USD_SGD, 2)
+    sl_sgd = round(TRADE_SIZE * SL_PIPS * ASSET["pip"] * USD_SGD, 2)
+    tp_sgd = round(TRADE_SIZE * TP_PIPS * ASSET["pip"] * USD_SGD, 2)
 
     result = trader.place_order(
         instrument=name,
@@ -370,7 +393,7 @@ def run_bot(state):
         price, _, _ = trader.get_price(name)
         cur_bal_sgd = round(current_balance * USD_SGD, 2)
         alert.send(
-            "🔄 NEW TRADE!  [" + sess["label"] + "]\n"
+            "🔄 NEW TRADE!  [NY Session]\n"
             + ASSET["emoji"] + " EUR/USD\n"
             "Direction: " + direction + "\n"
             "Entry:     " + str(round(price, ASSET["precision"])) + "\n"
@@ -379,9 +402,9 @@ def run_bot(state):
             "TP:        " + str(TP_PIPS) + " pips = SGD " + str(tp_sgd) + "\n"
             "─────────────────\n"
             "Balance:   SGD " + str(cur_bal_sgd) + "\n"
-            "Day trade: " + str(today_trades + 1) + "/" + str(MAX_PER_DAY) + "\n"
-            "Session:   " + sess["sgt_label"] + "\n"
-            "Spread:    " + str(round(spread_pip, 2)) + "p | Score: " + str(score) + "/4 ✅"
+            "Spread:    " + str(round(spread_pip, 2)) + "p | Score: " +
+            str(score) + "/4 ✅\n"
+            "Max hold:  45 min"
         )
         log.info(name + ": PLACED " + direction +
                  " TP=SGD" + str(tp_sgd) + " SL=SGD" + str(sl_sgd))

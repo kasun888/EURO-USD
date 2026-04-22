@@ -1,15 +1,12 @@
 """
-Railway Entry Point — EUR/USD Multi-Session Scalp Bot V4
-=========================================================
-Sessions:
-  Asian/London  06:00–09:00 UTC  (14:00–17:00 SGT)
-  London        09:00–12:00 UTC  (17:00–20:00 SGT)
-  NY            13:00–16:00 UTC  (21:00–00:00 SGT)
-Strategy: Triple-Confirm Trend Scalp
-  SL=8 pips | TP=12 pips | R:R 1.5 | Max 45 min | 2 trades/day
+Railway Entry Point — EUR/USD NY Scalp Bot V7-PLUS
+====================================================
+Session:  NY only — 13:00–16:00 UTC (21:00–00:00 SGT)
+Strategy: V7-PLUS — 4-layer trend confirm + circuit breaker
+  SL=7 pips (≈SGD 70) | TP=10 pips (≈SGD 100) | R:R 1.43
+  Max 1 trade/day | 45 min hold | Circuit breaker after 2 SL
 
-Scans every 5 minutes via Railway cron.
-Sends Telegram alerts on trade open / TP / SL / timeout.
+All Telegram alerts show SGD amounts and live balance.
 """
 
 import os
@@ -20,7 +17,7 @@ from datetime import datetime
 
 import pytz
 
-from bot            import run_bot, ASSET, get_active_session
+from bot            import run_bot, ASSET, is_in_session
 from oanda_trader   import OandaTrader
 from telegram_alert import TelegramAlert
 
@@ -47,6 +44,8 @@ def fresh_day_state(today_str, balance):
         "wins":            0,
         "losses":          0,
         "consec_losses":   0,
+        "consec_sl":       0,
+        "pause_until":     None,
         "cooldown_until":  None,
         "daily_trades":    {},
         "open_times":      {},
@@ -79,11 +78,10 @@ def main():
     global STATE
 
     log.info("=" * 55)
-    log.info("🚀 EUR/USD Bot V4 Started — All Sessions")
-    log.info("Asian/London: 06-09 UTC (14-17 SGT)")
-    log.info("London:       09-12 UTC (17-20 SGT)")
-    log.info("NY:           13-16 UTC (21-00 SGT)")
-    log.info("SL=8p | TP=12p | R:R=1.5 | Max 45 min | 2 trades/day")
+    log.info("🚀 EUR/USD Bot V7-PLUS Started")
+    log.info("Session:  NY only — 13:00–16:00 UTC (21:00–00:00 SGT)")
+    log.info("SL=7p (≈SGD 70) | TP=10p (≈SGD 100) | R:R=1.43")
+    log.info("Max 1 trade/day | Circuit breaker after 2 SL hits")
     log.info("=" * 55)
 
     if not check_env():
@@ -93,14 +91,15 @@ def main():
 
     alert = TelegramAlert()
     alert.send(
-        "🚀 EUR/USD Bot V4 Started!\n"
-        "Strategy: Triple-Confirm Trend Scalp\n"
+        "🚀 EUR/USD Bot V7-PLUS Started!\n"
+        "Strategy: 4-Layer NY Trend Scalp\n"
         "Pair:     EUR/USD\n"
-        "SL: 8 pip | TP: 12 pip | R:R: 1.5\n"
-        "Sessions: Asian/London 14-17 SGT\n"
-        "          London       17-20 SGT\n"
-        "          NY           21-00 SGT\n"
-        "Max:      2 trades/day | 45 min hold"
+        "SL: 7 pip ≈ SGD 70\n"
+        "TP: 10 pip ≈ SGD 100\n"
+        "R:R: 1.43\n"
+        "Session: NY only — 21:00–00:00 SGT\n"
+        "Max: 1 trade/day | 45 min hold\n"
+        "Circuit breaker: pause 2 days after 2 SL in a row"
     )
 
     while True:
@@ -110,7 +109,7 @@ def main():
 
             log.info("⏰ " + now.strftime("%Y-%m-%d %H:%M SGT"))
 
-            # Day reset
+            # Day reset — preserve circuit breaker + consec_sl across days
             if STATE.get("date") != today:
                 log.info("📅 New day — resetting state")
                 try:
@@ -119,8 +118,14 @@ def main():
                 except Exception as e:
                     log.warning("Balance fetch error: " + str(e))
                     balance = 0.0
-                log.info("Balance: $" + str(round(balance, 2)))
+                log.info("Balance: SGD " + str(round(balance * 1.35, 2)))
+                # Preserve circuit breaker across day reset
+                prev_pause = STATE.get("pause_until")
+                prev_consec_sl = STATE.get("consec_sl", 0)
                 STATE = fresh_day_state(today, balance)
+                if prev_pause:
+                    STATE["pause_until"] = prev_pause
+                STATE["consec_sl"] = prev_consec_sl
 
             run_bot(state=STATE)
 
