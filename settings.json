@@ -75,8 +75,8 @@
   "orb_fresh_minutes": 60,
   "orb_aging_minutes": 120,
   "orb_formation_minutes": 15,
-  "_comment_be": "Break-even management from Fiber Scalp.",
-  "breakeven_enabled": true,
+  "_comment_be": "Break-even disabled \u2014 enable only after verifying modify_sl precision in demo logs.",
+  "breakeven_enabled": false,
   "be_trigger_pips": 20,
   "news_filter_enabled": true,
   "news_block_before_min": 30,
@@ -116,5 +116,6 @@
   "tp2_rr_reference": 3.0,
   "max_trades_tokyo": 10,
   "rr_ratio": 1.67,
-  "_comment_ema": "Hybrid signals.py uses fixed EMA periods: H4=EMA50, H1=EMA21/EMA50, M5=EMA13, VETO=EMA200. ema_fast/slow_period not used."
+  "_comment_ema": "Hybrid signals.py uses fixed EMA periods: H4=EMA50, H1=EMA21/EMA50, M5=EMA13, VETO=EMA200. ema_fast/slow_period not used.",
+  "score_6_risk_usd": 50
 }

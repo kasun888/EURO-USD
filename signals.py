@@ -465,9 +465,9 @@ class SignalEngine:
                     return max(int(sr[k]), 0)
                 except (TypeError, ValueError):
                     break
-        if score >= 6: return int(settings.get("position_full_usd", 50))
-        if score >= 5: return int(settings.get("position_full_usd", 40))
-        if score >= 4: return int(settings.get("position_partial_usd", 30))
+        if score >= 6: return int(s.get("score_6_risk_usd", 50))   # FIX SCORE6-FALLBACK
+        if score >= 5: return int(s.get("position_full_usd", 40))
+        if score >= 4: return int(s.get("position_partial_usd", 30))
         return 0
 
     # ── OANDA candle fetcher ──────────────────────────────────────────────────

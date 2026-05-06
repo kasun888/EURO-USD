@@ -306,13 +306,18 @@ class OandaTrader:
             log.warning("get_trade_pnl error: %s", e)
             return None
 
-    def modify_sl(self, trade_id: str, new_sl_price: float) -> dict:
+    def modify_sl(self, trade_id: str, new_sl_price: float,
+                  instrument: str = "EUR_USD") -> dict:
         try:
-            payload = {"stopLoss": {"price": f"{new_sl_price:.2f}", "timeInForce": "GTC"}}
+            # FIX SL-PRECISION: use instrument displayPrecision, not hardcoded .2f
+            specs = self.get_instrument_specs(instrument)
+            dp    = int(specs.get("displayPrecision", 5))
+            price_str = f"{new_sl_price:.{dp}f}"
+            payload = {"stopLoss": {"price": price_str, "timeInForce": "GTC"}}
             r = self._request("PUT", f"/v3/accounts/{self.account_id}/trades/{trade_id}/orders", json=payload, timeout=15)
             data = r.json()
             if r.status_code in [200, 201]:
-                log.info("SL moved to %.2f for trade %s", new_sl_price, trade_id)
+                log.info("SL moved to %s for trade %s", price_str, trade_id)
                 return {"success": True}
             log.warning("modify_sl failed: %s %s", r.status_code, str(data)[:200])
             return {"success": False, "error": data.get("errorMessage", str(data))}
@@ -369,6 +374,9 @@ class OandaTrader:
                     if t.get("instrument") == instrument and t.get("tradesClosed")
                 ]
                 return closing
+            if r.status_code == 401:
+                log.debug("get_today_closed_transactions: 401 — transactions endpoint not authorized on this account (non-fatal, startup reconcile skipped)")
+                return []
             log.warning(
                 "get_today_closed_transactions HTTP %s: %s",
                 r.status_code, r.text[:200],

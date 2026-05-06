@@ -59,6 +59,7 @@ SGT          = pytz.timezone("Asia/Singapore")
 HISTORY_FILE = TRADE_HISTORY_FILE
 
 _startup_reconcile_done: bool = False
+_signal_engine_cache: dict = {}   # FIX ENGINE-LEAK: reuse SignalEngine per demo mode
 
 SESSION_BANNERS = {
     "London": "🇬🇧 LONDON",
@@ -814,18 +815,17 @@ def backfill_pnl(history: list, trader, alert, settings: dict,
         _today_for_circuit = get_trading_day(datetime.now(SGT),
                                               int(settings.get("trading_day_start_hour_sgt", 8)))
         if pnl > 0:
-            record_win(_today_for_circuit)
+            record_win(_today_for_circuit, alert=alert)
         elif pnl < 0:
             rt_file = _pair_runtime_file(instrument)
             rt = load_json(rt_file, {})
             rt["last_sl_closed_at_sgt"] = trade["closed_at_sgt"]
             save_json(rt_file, rt)
-            _trader_obj = settings.get("_trader_ref")  # injected by _guard_phase if available
             from config_loader import load_secrets as _ls
             _api_key  = _ls().get("OANDA_API_KEY", "")
             _base_url = ("https://api-fxpractice.oanda.com" if settings.get("demo_mode", True)
                          else "https://api-fxtrade.oanda.com")
-            record_sl(trade.get("direction", ""), _api_key, _base_url, settings)
+            record_sl(trade.get("direction", ""), _api_key, _base_url, settings, alert=alert)
 
         if not trade.get("closed_alert_sent"):
             try:
@@ -1123,29 +1123,6 @@ def _guard_phase(db, run_id, settings, alert, history, now_sgt, today, demo,
                                  "daily_pnl": _dp_pre, "cap_usd": _daily_risk_cap})
         return None
 
-    # ── Win-stop check (1 win per day then stop) ─────────────────────────
-    if settings.get("win_stop_per_day", True) and is_win_stop_active(today):
-        msg = f"✅ [{instrument}] Win-stop — first win secured, no more trades today."
-        send_once_per_state(alert, ops, "ops_state",
-                            f"win_stop:{today}", msg, instrument)
-        update_runtime_state(last_cycle_finished=now_sgt.strftime("%Y-%m-%d %H:%M:%S"),
-                             status="SKIPPED_WIN_STOP")
-        db.finish_cycle(run_id, status="SKIPPED",
-                        summary={"stage": "win_stop", "instrument": instrument})
-        return None
-
-    # ── Circuit breaker check ─────────────────────────────────────────────
-    if settings.get("circuit_breaker_enabled", True):
-        _cb_active, _cb_reason = is_circuit_breaker_active(settings)
-        if _cb_active:
-            send_once_per_state(alert, ops, "ops_state",
-                                f"circuit:{_cb_reason}", f"⛔ [{instrument}] {_cb_reason}", instrument)
-            update_runtime_state(last_cycle_finished=now_sgt.strftime("%Y-%m-%d %H:%M:%S"),
-                                 status="SKIPPED_CIRCUIT_BREAKER")
-            db.finish_cycle(run_id, status="SKIPPED",
-                            summary={"stage": "circuit_breaker", "instrument": instrument})
-            return None
-
     _max_day_trades = int(settings.get("max_trades_day", 20))
     if _max_day_trades > 0 and _dt_pre >= _max_day_trades:
         msg = (f"🛑 [{instrument}] Daily trade cap ({_dt_pre}/{_max_day_trades}) — "
@@ -1193,6 +1170,29 @@ def _guard_phase(db, run_id, settings, alert, history, now_sgt, today, demo,
                                      "instrument": instrument,
                                      "session": macro,
                                      "losses": _sl_sess, "cap": _sl_cap})
+            return None
+
+    # ── Win-stop check — before OANDA login to save API calls ───────────
+    if settings.get("win_stop_per_day", True) and is_win_stop_active(today):
+        msg = f"✅ [{instrument}] Win-stop — first win secured, no more trades today."
+        send_once_per_state(alert, ops, "ops_state",
+                            f"win_stop:{today}", msg, instrument)
+        update_runtime_state(last_cycle_finished=now_sgt.strftime("%Y-%m-%d %H:%M:%S"),
+                             status="SKIPPED_WIN_STOP")
+        db.finish_cycle(run_id, status="SKIPPED",
+                        summary={"stage": "win_stop", "instrument": instrument})
+        return None
+
+    # ── Circuit breaker check — before OANDA login to save API calls ─────
+    if settings.get("circuit_breaker_enabled", True):
+        _cb_active, _cb_reason = is_circuit_breaker_active(settings)
+        if _cb_active:
+            send_once_per_state(alert, ops, "ops_state",
+                                f"circuit:{_cb_reason}", f"⛔ [{instrument}] {_cb_reason}", instrument)
+            update_runtime_state(last_cycle_finished=now_sgt.strftime("%Y-%m-%d %H:%M:%S"),
+                                 status="SKIPPED_CIRCUIT_BREAKER")
+            db.finish_cycle(run_id, status="SKIPPED",
+                            summary={"stage": "circuit_breaker", "instrument": instrument})
             return None
 
     # ── OANDA login ───────────────────────────────────────────────────────────
@@ -1340,9 +1340,21 @@ def _signal_phase(db, run_id, settings, alert, trader, history,
     pip             = _pip_size(settings)
     dp              = _pip_dp(pip)
 
-    engine = SignalEngine(demo=demo)
+    # FIX ENGINE-LEAK: reuse SignalEngine instead of creating new one every cycle
+    _engine_key = "demo" if demo else "live"
+    if _engine_key not in _signal_engine_cache:
+        _signal_engine_cache[_engine_key] = SignalEngine(demo=demo)
+    engine = _signal_engine_cache[_engine_key]
+
+    # FIX NO-STATE: load per-pair signal state so L2 pending system works
+    _sig_state_file = DATA_DIR / f"signal_state_{_pair_key(instrument)}.json"
+    _sig_state = load_json(_sig_state_file, {})
+
     score, direction, details, levels, position_usd = engine.analyze(
-        instrument=instrument, settings=settings)
+        instrument=instrument, settings=settings, state=_sig_state)
+
+    # Save state back so l2_pending persists to the next 5-min cycle
+    save_json(_sig_state_file, _sig_state)
 
     raw_score        = score
     raw_position_usd = position_usd
